@@ -23,15 +23,14 @@ class CubCsvDataset(Dataset):
     """
     Dataset for the prepared CUB-200 data.
 
-    Works with the original CSVs from prepare_cub200_for_kaggle.py
-    without modifying them:
+    Works with the CSVs produced by prepare_cub200_for_kaggle.py, e.g.:
 
-      - train_labels.csv: ['id', 'class_id']
-      - val_labels.csv:   ['id', 'class_id']
-      - test_images.csv:  ['id']
+      - train_labels.csv: ['filename', 'class_id', 'class_name']
+      - val_labels.csv:   ['filename', 'class_id', 'class_name']
+      - test_images.csv:  ['filename']
 
     We mainly rely on column positions:
-      - column 0: image id / filename
+      - column 0: image filename
       - column 1: label (for train/val only)
     """
 
@@ -58,6 +57,8 @@ class CubCsvDataset(Dataset):
             img_name = row["image"]
         elif "id" in self.df.columns:
             img_name = row["id"]
+        elif "filename" in self.df.columns:
+            img_name = row["filename"]
         else:
             img_name = row.iloc[0]  # first column as fallback
 
@@ -129,7 +130,9 @@ def build_backbone(ckpt_path: str, device: torch.device) -> nn.Module:
       - a 'student' key with the model state_dict, or
       - is itself a state_dict.
 
-    Also strips leading "0." in keys (common when checkpoint stores a module list).
+    Also:
+      - strips leading "0." in keys (common when checkpoint stores a module list),
+      - SKIPS loading 'pos_embed' to avoid size mismatch between 224- and 96-res.
     """
     print(f"Loading DINO student from: {ckpt_path}")
 
@@ -147,13 +150,16 @@ def build_backbone(ckpt_path: str, device: torch.device) -> nn.Module:
     else:
         state_dict = ckpt
 
-    # Strip leading "0." prefix if present
+    # Strip leading "0." prefix if present and skip pos_embed
     new_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith("0."):
             new_k = k.split(".", 1)[1]  # drop "0."
         else:
             new_k = k
+        # Skip loading pos_embed (let timm initialize it for 96x96)
+        if new_k.endswith("pos_embed"):
+            continue
         new_state_dict[new_k] = v
 
     missing, unexpected = backbone.load_state_dict(new_state_dict, strict=False)
@@ -231,8 +237,8 @@ def predict_test(model, loader, device, test_dataset, out_csv_path: str):
     """
     Run inference on the test set and write a Kaggle submission CSV.
 
-    We use the original CUB ids from test_images.csv and
-    produce columns: id, class_id
+    We use the filenames from test_images.csv and
+    produce columns: id, class_id (id = filename).
     """
     model.eval()
     all_preds = []
@@ -245,11 +251,13 @@ def predict_test(model, loader, device, test_dataset, out_csv_path: str):
             preds = logits.argmax(dim=1).cpu().tolist()
             all_preds.extend(preds)
 
-    # test_dataset.df first column is the original id
+    # test_dataset.df first column is the original filename
     if "id" in test_dataset.df.columns:
         ids = test_dataset.df["id"].tolist()
     elif "image" in test_dataset.df.columns:
         ids = test_dataset.df["image"].tolist()
+    elif "filename" in test_dataset.df.columns:
+        ids = test_dataset.df["filename"].tolist()
     else:
         ids = test_dataset.df.iloc[:, 0].tolist()  # first column fallback
 
