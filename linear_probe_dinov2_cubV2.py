@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import os
 import argparse
-import json
 from typing import Tuple
 
 import pandas as pd
@@ -16,75 +15,82 @@ import timm
 import torchvision.transforms as T
 
 
-# -------------------------
+# ============================================================
 # Dataset
-# -------------------------
+# ============================================================
 
 class CubCsvDataset(Dataset):
     """
     Dataset for the prepared CUB-200 data.
 
-    Supports the original CSV formats from prepare_cub200_for_kaggle.py:
+    Works with the original CSVs from prepare_cub200_for_kaggle.py
+    without modifying them:
 
-    - train_labels.csv: columns ['id', 'class_id']
-    - val_labels.csv:   columns ['id', 'class_id']
-    - test_images.csv:  column  ['id']
+      - train_labels.csv: ['id', 'class_id']
+      - val_labels.csv:   ['id', 'class_id']
+      - test_images.csv:  ['id']
 
-    We map these to internal names in memory only:
-    - 'id'       -> 'image'
-    - 'class_id' -> 'label' (for train/val)
+    We mainly rely on column positions:
+      - column 0: image id / filename
+      - column 1: label (for train/val only)
     """
 
     def __init__(self, csv_file: str, root_dir: str, mode: str = "train",
                  transform=None):
-        """
-        Parameters
-        ----------
-        csv_file : str
-            Path to CSV (train_labels.csv, val_labels.csv, or test_images.csv).
-        root_dir : str
-            Root directory containing the image files.
-        mode : {"train", "val", "test"}
-        transform : callable, optional
-            Transform to apply to the images.
-        """
         self.df = pd.read_csv(csv_file)
         self.root_dir = root_dir
-        self.mode = mode
+        self.mode = mode  # "train", "val", or "test"
         self.transform = transform
 
-        # Rename columns in-memory to a standard interface
-        if "image" not in self.df.columns and "id" in self.df.columns:
-            self.df = self.df.rename(columns={"id": "image"})
-
-        if self.mode in ("train", "val"):
-            if "label" not in self.df.columns and "class_id" in self.df.columns:
-                self.df = self.df.rename(columns={"class_id": "label"})
+        # Log for sanity
+        print(f"[CubCsvDataset] mode={self.mode}, csv={csv_file}")
+        print(f"[CubCsvDataset] columns={list(self.df.columns)}")
 
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         row = self.df.iloc[idx]
-        img_name = row["image"]
-        img_path = os.path.join(self.root_dir, img_name)
 
+        # --------- IMAGE NAME ----------
+        # Prefer named columns, fall back to first column
+        if "image" in self.df.columns:
+            img_name = row["image"]
+        elif "id" in self.df.columns:
+            img_name = row["id"]
+        else:
+            img_name = row.iloc[0]  # first column as fallback
+
+        img_path = os.path.join(self.root_dir, img_name)
         img = Image.open(img_path).convert("RGB")
 
         if self.transform is not None:
             img = self.transform(img)
 
+        # --------- LABEL ----------
         if self.mode == "test":
             label = -1  # dummy
         else:
-            label = int(row["label"])
+            if "label" in self.df.columns:
+                label = int(row["label"])
+            elif "class_id" in self.df.columns:
+                label = int(row["class_id"])
+            else:
+                # Fallback: assume second column is label
+                if len(self.df.columns) > 1:
+                    label = int(row.iloc[1])
+                else:
+                    raise RuntimeError(
+                        f"No label column found for train/val CSV "
+                        f"(columns: {list(self.df.columns)})"
+                    )
 
         return img, label
 
 
-# -------------------------
+# ============================================================
 # Model
-# -------------------------
+# ============================================================
 
 class LinearClassifier(nn.Module):
     """
@@ -95,43 +101,62 @@ class LinearClassifier(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-        # infer embedding dimension on the same device as the backbone
+        # Infer embedding dimension on the same device as backbone
         device = next(backbone.parameters()).device
         example = torch.zeros(1, 3, 96, 96, device=device)
         with torch.no_grad():
             feat = self.backbone(example)
-
         if feat.ndim > 2:
             feat = feat.mean(dim=(-2, -1))
-
         in_dim = feat.shape[-1]
+
         self.head = nn.Linear(in_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            feats = self.backbone(x)
+        if feats.ndim > 2:
+            feats = feats.mean(dim=(-2, -1))
+        logits = self.head(feats)
+        return logits
 
 
 def build_backbone(ckpt_path: str, device: torch.device) -> nn.Module:
     """
-    Build a ViT-S/14 DINOv2-style backbone and load weights from checkpoint.
-    Assumes checkpoint has a 'student' key; falls back to direct state dict.
+    Build a ViT-S/14 DINOv2-like backbone and load weights from checkpoint.
+
+    Assumes your checkpoint has either:
+      - a 'student' key with the model state_dict, or
+      - is itself a state_dict.
+
+    Also strips leading "0." in keys (common when checkpoint stores a module list).
     """
     print(f"Loading DINO student from: {ckpt_path}")
 
-    # vit_small_patch14_dinov2 style architecture, but no classifier head
+    # Create the backbone model (no classifier head)
     backbone = timm.create_model(
         "vit_small_patch14_dinov2.lvd142m",
         pretrained=False,
-        num_classes=0,  # feature extractor
+        num_classes=0,
         img_size=96,
     )
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    # ckpt may be {'student': state_dict, ...} or a raw state dict
     if isinstance(ckpt, dict) and "student" in ckpt:
         state_dict = ckpt["student"]
     else:
         state_dict = ckpt
 
-    # Sometimes extra keys exist (e.g., DINO heads) – ignore those that don't fit
-    missing, unexpected = backbone.load_state_dict(state_dict, strict=False)
+    # Strip leading "0." prefix if present
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("0."):
+            new_k = k.split(".", 1)[1]  # drop "0."
+        else:
+            new_k = k
+        new_state_dict[new_k] = v
+
+    missing, unexpected = backbone.load_state_dict(new_state_dict, strict=False)
     print("Backbone loaded. Missing keys:", missing)
     print("Unexpected keys:", unexpected)
 
@@ -142,9 +167,9 @@ def build_backbone(ckpt_path: str, device: torch.device) -> nn.Module:
     return backbone
 
 
-# -------------------------
+# ============================================================
 # Training / Evaluation
-# -------------------------
+# ============================================================
 
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
@@ -204,10 +229,10 @@ def evaluate(model, loader, device):
 
 def predict_test(model, loader, device, test_dataset, out_csv_path: str):
     """
-    Run inference on the test set and write submission CSV.
+    Run inference on the test set and write a Kaggle submission CSV.
 
     We use the original CUB ids from test_images.csv and
-    produce a file with columns: id, class_id
+    produce columns: id, class_id
     """
     model.eval()
     all_preds = []
@@ -220,19 +245,28 @@ def predict_test(model, loader, device, test_dataset, out_csv_path: str):
             preds = logits.argmax(dim=1).cpu().tolist()
             all_preds.extend(preds)
 
-    # 'image' column in test_dataset.df is the original 'id'
-    ids = test_dataset.df["image"].tolist()
+    # test_dataset.df first column is the original id
+    if "id" in test_dataset.df.columns:
+        ids = test_dataset.df["id"].tolist()
+    elif "image" in test_dataset.df.columns:
+        ids = test_dataset.df["image"].tolist()
+    else:
+        ids = test_dataset.df.iloc[:, 0].tolist()  # first column fallback
+
     if len(ids) != len(all_preds):
-        raise RuntimeError("Mismatch between number of test ids and predictions.")
+        raise RuntimeError(
+            f"Mismatch between number of test ids ({len(ids)}) "
+            f"and predictions ({len(all_preds)})"
+        )
 
     out_df = pd.DataFrame({"id": ids, "class_id": all_preds})
     out_df.to_csv(out_csv_path, index=False)
     print(f"Saved submission to: {out_csv_path}")
 
 
-# -------------------------
+# ============================================================
 # Main
-# -------------------------
+# ============================================================
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -266,10 +300,10 @@ def main():
     test_root = os.path.join(args.data_dir, "test")
 
     train_csv = os.path.join(args.data_dir, "train_labels.csv")
-    val_csv = os.path.join(args.data_dir, "val_labels.csv")
-    test_csv = os.path.join(args.data_dir, "test_images.csv")
+    val_csv   = os.path.join(args.data_dir, "val_labels.csv")
+    test_csv  = os.path.join(args.data_dir, "test_images.csv")
 
-    # Transforms (can be tuned)
+    # Transforms
     train_transform = T.Compose([
         T.Resize(96),
         T.RandomResizedCrop(96, scale=(0.8, 1.0)),
@@ -336,7 +370,7 @@ def main():
     best_val_acc = 0.0
     best_ckpt_path = os.path.join(args.output_dir, "linear_probe_best.pth")
 
-    # Optionally only predict with an existing trained head
+    # ----------------- Training -----------------
     if args.mode in ("train", "train_and_predict"):
         for epoch in range(args.epochs):
             print(f"\n=== Epoch {epoch+1}/{args.epochs} ===")
@@ -347,7 +381,6 @@ def main():
             val_loss, val_acc = evaluate(model, val_loader, device)
             print(f"Val   loss: {val_loss:.4f}, acc: {val_acc:.4f}")
 
-            # Save best on validation
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 torch.save(
@@ -363,7 +396,6 @@ def main():
 
     # ----------------- Prediction on test -----------------
     if args.mode in ("predict", "train_and_predict"):
-        # if we trained, reload best checkpoint
         if os.path.exists(best_ckpt_path):
             print(f"Loading best linear head from {best_ckpt_path}")
             ckpt = torch.load(best_ckpt_path, map_location=device)
